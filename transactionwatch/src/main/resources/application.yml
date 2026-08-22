@@ -1,0 +1,119 @@
+server:
+  port: ${SERVER_PORT:8081}
+
+spring:
+  application:
+    name: transactionwatch
+  profiles:
+    active: local
+  jackson:
+    default-property-inclusion: non_null
+  kafka:
+    consumer:
+      group-id: transactionwatch-fraud-engine
+      # Deserializer wiring (JsonDeserializer, trusted packages, manual ack,
+      # retry backoff) is set explicitly in KafkaConsumerConfig rather than
+      # here, so the typed ConsumerFactory<String, TransactionCreatedEvent>
+      # bean is the single source of truth instead of splitting it across
+      # YAML and code.
+
+jwt:
+  # Shared JWT signing secret — see README "auth approach" for the tradeoff
+  # of reusing SecureLedger's issuer vs. an independent admin login.
+  secret: ${JWT_SECRET:change-this-dev-secret-change-this-dev-secret-32bytes}
+
+transactionwatch:
+  topics:
+    transactions-created: transactions.created
+    transactions-created-dlt: transactions.created.DLT
+  rules:
+    velocity:
+      enabled: true
+      threshold-count: 5
+      window-seconds: 60
+    large-amount:
+      enabled: true
+      threshold-amount: 10000.00
+  redis:
+    activity-key-prefix: "activity:"
+    retention-seconds: 600 # 10 minutes — widest rule window plus headroom
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+---
+spring:
+  config:
+    activate:
+      on-profile: local
+  datasource:
+    url: jdbc:postgresql://localhost:5432/transactionwatch
+    username: ${DB_USERNAME:transactionwatch}
+    password: ${DB_PASSWORD:transactionwatch}
+  jpa:
+    hibernate:
+      ddl-auto: validate # schema owned by Flyway, not Hibernate
+    show-sql: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+---
+spring:
+  config:
+    activate:
+      on-profile: test
+  datasource:
+    url: jdbc:h2:mem:transactionwatch;MODE=PostgreSQL;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    database-platform: org.hibernate.dialect.H2Dialect
+  flyway:
+    enabled: false # H2 test profile lets Hibernate create the schema directly
+  kafka:
+    bootstrap-servers: ${spring.embedded.kafka.brokers:localhost:9092}
+
+---
+spring:
+  config:
+    activate:
+      on-profile: docker
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://postgres:5432/transactionwatch}
+    username: ${DB_USERNAME:transactionwatch}
+    password: ${DB_PASSWORD:transactionwatch}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:kafka:9092}
+  data:
+    redis:
+      host: ${REDIS_HOST:redis}
+      port: ${REDIS_PORT:6379}
