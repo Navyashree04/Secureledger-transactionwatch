@@ -1,3 +1,16 @@
+<img src="https://capsule-render.vercel.app/api?type=waving&color=0:0f2027,50:203a43,100:2c5364&height=180&section=header&text=TransactionWatch&fontSize=46&fontColor=ffffff&fontAlignY=38&desc=Event-driven%20fraud%20alerting%20%C2%B7%20Spring%20Boot%20%C2%B7%20Kafka%20%C2%B7%20Redis&descAlignY=60&descSize=16" width="100%"/>
+
+<div align="center">
+
+<img src="https://skillicons.dev/icons?i=java,spring,kafka,redis,postgres,docker,prometheus&theme=dark" />
+<br/><br/>
+<img src="https://img.shields.io/badge/Delivery-at--least--once-00E5FF?style=flat-square" />
+<img src="https://img.shields.io/badge/Run-docker%20compose%20up-2496ED?style=flat-square" />
+
+</div>
+
+> 📚 Short on time before an interview? Open the **Deep dive** at the bottom of this page.
+
 # SecureLedger + TransactionWatch — Event-Driven Fraud Alerting
 
 Two independently-deployable Spring Boot services connected by Kafka:
@@ -198,3 +211,74 @@ not an oversight):**
   modes
 - **Currency normalization** in `LargeAmountRule` — amounts are compared
   against a single threshold with no FX conversion between currencies
+
+
+---
+
+<details>
+<summary><b>📚 Deep dive: interview notes (click to expand)</b></summary>
+
+### 1. Elevator pitch (30 seconds)
+Two independent Spring Boot services connected by Kafka. **SecureLedger** (the banking API) publishes an event every time money moves. **TransactionWatch** consumes those events, keeps each account's recent activity in a Redis sliding window, runs fraud rules, and stores alerts that an admin reviews through a JWT-secured REST API. The point: fraud detection never slows down or breaks the core banking path.
+
+### 2. Architecture and event flow
+```text
+SecureLedger ──commit DB tx──► publish TransactionCreatedEvent (keyed by accountId)
+                                          │
+                                          ▼
+                            Kafka topic: transactions.created
+                                          │
+                                          ▼
+TransactionWatch @KafkaListener (manual ack, 3 retries, 1s backoff)
+      │
+      ├─► Redis sorted set per account (score = timestamp, pruned on write, TTL 10 min)
+      │
+      ├─► RuleEngine ─► VelocityRule   (≥ 5 transactions in 60 s)
+      │               └► LargeAmountRule (amount ≥ 10,000)
+      │
+      ├─► Alert ─► PostgreSQL (Flyway-migrated, indexed)
+      │
+      └─► ack offset (only after everything above succeeded)
+
+Admin REST API (JWT, ADMIN only, OpenAPI) · Actuator health + Prometheus metrics
+```
+Both services, Postgres, Kafka (KRaft, no ZooKeeper) and Redis start with one `docker compose up`, each gated on the health of what it depends on.
+
+### 3. Key design decisions and trade-offs
+| Decision | Why | Trade-off |
+|:--|:--|:--|
+| Event-driven, not a synchronous call | A slow or broken fraud service can't hurt the banking API; new consumers subscribe without touching SecureLedger | Fraud detection is eventually consistent (seconds behind) |
+| Publish **after** DB commit | Never announce a transaction that later rolls back | A crash between commit and send can drop an event (fix: outbox pattern) |
+| **At-least-once** delivery | A duplicate alert is far cheaper than a missed fraud signal; processing is safe to repeat | Possible duplicate alerts |
+| **Manual offset commit** | With auto-commit, a crash mid-processing could mark unfinished work as done | Slightly more code |
+| Partition key = `accountId` | All events for one account stay in order on one partition; the velocity rule needs that | A very hot account can't be split across consumers |
+| Redis sorted set as a sliding window | O(log N) per event and keeps Postgres off the hot path (only alerts hit the DB) | Window state lives in memory and is rebuilt from new events after a Redis loss |
+| Rules as `FraudRule` beans, thresholds in config | Add a rule by adding a class; tune thresholds without code changes | No rule versioning yet |
+| Shared JWT issuer | The same token works on both services | Services share a signing secret |
+
+### 4. Where the important code lives
+- `secureledger/.../event/TransactionEventPublisher.java`: publish-after-commit and the reasoning behind it
+- `transactionwatch/.../event/TransactionEventListener.java`: consume, process, then ack
+- `transactionwatch/.../cache/RedisAccountActivityService.java`: the sliding window
+- `transactionwatch/.../rules/`: `RuleEngine`, `VelocityRule`, `LargeAmountRule`
+- `transactionwatch/src/main/resources/application.yml`: rule thresholds
+- `docker-compose.yml` + `postgres-init/`: the whole system in one command
+
+### 5. Testing
+Tests exist for each rule (`VelocityRuleTest`, `LargeAmountRuleTest`, `RuleEngineTest`), the Kafka listener (`TransactionEventListenerTest`), the Redis window (`RedisAccountActivityServiceTest`), alert persistence (`AlertRepositoryIntegrationTest`) and the admin API (`AdminAlertControllerTest`).
+
+### 6. Limitations and what I'd do next
+- A **dead-letter topic** (`transactions.created.DLT`) for messages that still fail after retries (today they're logged).
+- The **outbox pattern** in SecureLedger to close the commit-then-publish gap.
+- **Idempotent alert writes** (unique on event id) to remove duplicate alerts.
+- Calling **FraudScope** (my ML service) for an ML risk score on flagged transactions. The REST contract is designed but not wired in.
+
+### 7. Likely interview questions
+- **Why Kafka instead of calling the fraud service directly?** Decoupling: the banking API's latency and availability don't depend on fraud detection, Kafka keeps events while the consumer is down, and new consumers need no producer changes.
+- **What happens if TransactionWatch is down?** Nothing is lost. Kafka retains the events, and on restart the consumer group resumes from its last committed offset.
+- **At-least-once vs exactly-once: which did you choose, and why?** At-least-once. Processing is safe to repeat, and a lost fraud signal is worse than a duplicate alert.
+- **How do you keep per-account ordering with multiple consumers?** Key by `accountId`. One partition goes to one consumer in the group, so an account's events are always processed in order.
+- **Why Redis and not a Postgres query for "transactions in the last 60 s"?** It runs on every event; a sorted-set range is O(log N) in memory, and Postgres is only touched when there's an alert to save.
+- **How would you scale it?** Add partitions and TransactionWatch instances (up to the partition count) with no code change.
+
+</details>
